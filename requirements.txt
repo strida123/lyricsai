@@ -1,0 +1,8 @@
+streamlit
+openai 
+tempfile
+os
+srt
+zipfile
+math
+datetime
