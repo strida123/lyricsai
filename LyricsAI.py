@@ -19,11 +19,17 @@ def save_temp_file(uploaded_file, suffix):
 ########################################
 # 2) Make ZIP with original + final
 ########################################
-def create_zip(original_srt_str, aligned_srt_str):
+def create_zip(audio_basename, original_srt_str, aligned_srt_str):
+    """
+    Creates a ZIP file containing:
+      - {audio_basename}_transcription.srt
+      - {audio_basename}_corrected_transcription.srt
+    Returns the path to the .zip file.
+    """
     zip_path = tempfile.NamedTemporaryFile(delete=False, suffix=".zip").name
     with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("transcription.srt", original_srt_str)
-        zipf.writestr("corrected_transcription.srt", aligned_srt_str)
+        zipf.writestr(f"{audio_basename}_transcription.srt", original_srt_str)
+        zipf.writestr(f"{audio_basename}_corrected_transcription.srt", aligned_srt_str)
     return zip_path
 
 ########################################
@@ -64,7 +70,6 @@ def lyrics_to_word_list(lyrics_text):
     lines = lyrics_text.split('\n')  # keep empty lines
     word_list = []
     for line_idx, line in enumerate(lines):
-        # strip each line just for splitting
         words = line.strip().split()
         for w in words:
             word_list.append((w, line_idx))
@@ -108,6 +113,7 @@ def word_alignment(transcript_words, lyric_words):
         tw = normalize_word(transcript_word)
         return 0 if lw == tw else 1
 
+    # Fill DP table
     for i in range(L+1):
         for j in range(T+1):
             (curr_cost, _) = dp[i][j]
@@ -208,7 +214,7 @@ with st.sidebar:
 
 uploaded_audio = st.file_uploader("Upload Audio File", 
                                   type=["flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm"])
-lyrics_input = st.text_area("Paste Correct Lyrics Here")
+lyrics_input = st.text_area("Paste Lyrics")
 
 if uploaded_audio:
     if not openai_api_key:
@@ -216,8 +222,13 @@ if uploaded_audio:
         st.stop()
 
     if st.button("Generate SRT"):
+        # 1) Save the audio file
         audio_path = save_temp_file(uploaded_audio, ".wav")
 
+        # 2) Derive base name from the uploaded file
+        audio_basename = os.path.splitext(uploaded_audio.name)[0]
+
+        # 3) Call Whisper
         client = OpenAI(api_key=openai_api_key)
         with open(audio_path, "rb") as audio_file:
             with st.spinner("Transcribing with Whisper..."):
@@ -228,11 +239,13 @@ if uploaded_audio:
                 )
         whisper_srt_str = whisper_result_srt
 
+        # 4) If we have lyrics, do the alignment
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
             
-            zip_path = create_zip(whisper_srt_str, final_srt_str)
+            # 5) Create ZIP: filenames use audio_basename
+            zip_path = create_zip(audio_basename, whisper_srt_str, final_srt_str)
             st.success("Done! Download your SRT files below.")
             st.download_button(
                 "Download SRTs (ZIP)",
@@ -241,10 +254,11 @@ if uploaded_audio:
                 mime="application/zip"
             )
         else:
-            st.warning("No lyrics pasted! Showing only raw Whisper SRT.")
-            zip_path = create_zip(whisper_srt_str, whisper_srt_str)
+            # No lyrics, so just provide raw Whisper SRT
+            zip_path = create_zip(audio_basename, whisper_srt_str, whisper_srt_str)
+            st.warning("No lyrics pasted! Providing only raw Whisper SRT.")
             st.download_button(
-                "Download Raw Whisper SRT",
+                "Download Raw Whisper SRT (ZIP)",
                 data=open(zip_path, "rb"),
                 file_name="transcribed.zip",
                 mime="application/zip"
