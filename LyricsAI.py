@@ -215,9 +215,9 @@ def run_spleeter_vocals_mp3(input_audio_path):
     # Run Spleeter with 2 stems (vocals + accompaniment)
     cmd = [
         "spleeter", "separate",
-        "-i", input_audio_path,
         "-o", output_dir,
-        "-p", "spleeter:2stems"
+        "-p", "spleeter:2stems",
+        input_audio_path
     ]
     subprocess.run(cmd, check=True)
 
