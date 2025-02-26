@@ -1,5 +1,5 @@
 import streamlit as st
-from openai import OpenAI
+import openai
 import tempfile
 import os
 import srt
@@ -244,7 +244,7 @@ with st.sidebar:
     "[Need an API key?](https://platform.openai.com/account/api-keys)"
 
 uploaded_audio = st.file_uploader(
-    "Upload Audio File", 
+    "Upload Audio File",
     type=["flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm"]
 )
 lyrics_input = st.text_area("Paste Lyrics")
@@ -265,11 +265,12 @@ if uploaded_audio:
         # 3) Derive base name from the uploaded file (for output filenames)
         audio_basename = os.path.splitext(uploaded_audio.name)[0]
 
-        # 4) Transcribe the preprocessed audio with Whisper
-        client = OpenAI(api_key=openai_api_key)
+        # 4) Set the OpenAI API key, then transcribe
+        openai.api_key = openai_api_key
         with open(processed_audio_path, "rb") as audio_file:
             with st.spinner("Transcribing with Whisper..."):
-                whisper_result_srt = client.audio.transcriptions.create(
+                # Use transcribe for SRT
+                whisper_result_srt = openai.Audio.transcribe(
                     model="whisper-1",
                     file=audio_file,
                     response_format="srt"
