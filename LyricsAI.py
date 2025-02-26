@@ -226,6 +226,7 @@ def run_demucs(input_audio_path):
     return vocals_wav
 
 def convert_wav_to_mp3(wav_path):
+    st.write("vocals.wav size:", os.path.getsize(vocals_wav))
     """
     Converts a WAV file to MP3 using ffmpeg. Returns the path to the MP3 file.
     """
