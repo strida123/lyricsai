@@ -1,5 +1,5 @@
 import streamlit as st
-import openai
+from openai import OpenAI
 import tempfile
 import os
 import srt
@@ -114,6 +114,7 @@ def word_alignment(transcript_words, lyric_words):
         tw = normalize_word(transcript_word)
         return 0 if lw == tw else 1
 
+    # Fill DP table
     for i in range(L+1):
         for j in range(T+1):
             (curr_cost, _) = dp[i][j]
@@ -203,29 +204,29 @@ def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
     return build_lyrics_srt_from_word_alignment(correct_lyrics_text, alignment, transcript_word_list)
 
 ########################################
-# Spleeter Preprocessing: isolate vocals -> vocals.wav -> convert to MP3
+# Spleeter Preprocessing
 ########################################
 def run_spleeter_vocals_mp3(input_audio_path):
     """
-    Runs Spleeter (2 stems) to separate vocals into vocals.wav,
-    then converts that to vocals.mp3 using ffmpeg.
-    Returns the path to vocals.mp3.
+    Runs Spleeter (2 stems) to isolate vocals from the input audio file,
+    then converts the resulting 'vocals.wav' to 'vocals.mp3' via ffmpeg.
+    Returns the path to 'vocals.mp3'.
     """
     output_dir = tempfile.mkdtemp()
-    # Run Spleeter with 2 stems (vocals + accompaniment)
-    cmd = [
+    # 1) Use Spleeter to split into vocals + accompaniment
+    cmd_spleeter = [
         "spleeter", "separate",
-        "-o", output_dir,
         "-p", "spleeter:2stems",
+        "-o", output_dir,
         input_audio_path
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd_spleeter, check=True)
 
-    # Spleeter outputs: output_dir/<basename>/vocals.wav
+    # 2) Locate the 'vocals.wav' that Spleeter creates
     basename = os.path.splitext(os.path.basename(input_audio_path))[0]
     vocals_wav = os.path.join(output_dir, basename, "vocals.wav")
 
-    # Convert vocals.wav -> vocals.mp3 using ffmpeg
+    # 3) Convert that WAV to MP3
     vocals_mp3 = vocals_wav.replace(".wav", ".mp3")
     cmd_ffmpeg = ["ffmpeg", "-y", "-i", vocals_wav, vocals_mp3]
     subprocess.run(cmd_ffmpeg, check=True)
@@ -240,7 +241,6 @@ st.title("TVG LyricsAI")
 
 with st.sidebar:
     openai_api_key = st.text_input("OpenAI API Key", type="password")
-    use_spleeter = st.checkbox("Use Spleeter Vocal Isolation (preprocessing)?")
     "[Need an API key?](https://platform.openai.com/account/api-keys)"
 
 uploaded_audio = st.file_uploader(
@@ -255,29 +255,28 @@ if uploaded_audio:
         st.stop()
 
     if st.button("Generate SRT"):
-        # 1) Save the uploaded audio to a temp file
+        # 1) Save the original audio
         audio_path = save_temp_file(uploaded_audio, ".wav")
+
+        # 2) Isolate vocals and convert to MP3
+        with st.spinner("Isolating vocals via Spleeter..."):
+            processed_audio_path = run_spleeter_vocals_mp3(audio_path)
+
+        # 3) Derive base name from the uploaded file (for output filenames)
         audio_basename = os.path.splitext(uploaded_audio.name)[0]
 
-        # 2) Optionally run Spleeter
-        if use_spleeter:
-            with st.spinner("Running Spleeter (2 stems) to isolate vocals..."):
-                processed_audio_path = run_spleeter_vocals_mp3(audio_path)
-        else:
-            processed_audio_path = audio_path
-
-        # 3) Set OpenAI API key and transcribe with Whisper
-        openai.api_key = openai_api_key
+        # 4) Transcribe the preprocessed audio with Whisper
+        client = OpenAI(api_key=openai_api_key)
         with open(processed_audio_path, "rb") as audio_file:
             with st.spinner("Transcribing with Whisper..."):
-                whisper_result_srt = openai.Audio.transcribe(
+                whisper_result_srt = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
                     response_format="srt"
                 )
         whisper_srt_str = whisper_result_srt
 
-        # 4) If lyrics are provided, align them
+        # 5) If user provided lyrics, align them; otherwise just return raw SRT
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
