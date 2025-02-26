@@ -1,3 +1,2 @@
 ffmpeg
-libmp3lame0
 sox
