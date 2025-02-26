@@ -1,5 +1,5 @@
 import streamlit as st
-import OpenAI
+from openai import OpenAI
 import tempfile
 import os
 import srt
