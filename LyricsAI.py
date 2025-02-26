@@ -299,7 +299,7 @@ if uploaded_audio:
             st.download_button(
                 "Download Raw Whisper SRT (ZIP)",
                 data=open(zip_path, "rb"),
-                file_name="transcribed.zip",a
+                file_name="transcribed.zip",
                 mime="application/zip"
             )
 
