@@ -219,14 +219,23 @@ def run_demucs(input_audio_path):
         "-o", output_dir,
         input_audio_path
     ]
-    subprocess.run(cmd, check=True)
-    # Build path: output_dir/<basename>/vocals.wav
+    # Run Demucs capturing stdout/stderr
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Print logs in Streamlit to see what's happening
+    st.write("Demucs stdout:", result.stdout)
+    st.write("Demucs stderr:", result.stderr)
+    st.write("Demucs returncode:", result.returncode)
+
+    if result.returncode != 0:
+        st.error("Demucs command failed.")
+        return None
+
     basename = os.path.splitext(os.path.basename(input_audio_path))[0]
     vocals_wav = os.path.join(output_dir, basename, "vocals.wav")
     return vocals_wav
 
 def convert_wav_to_mp3(wav_path):
-    st.write("vocals.wav size:", os.path.getsize(vocals_wav))
     """
     Converts a WAV file to MP3 using ffmpeg. Returns the path to the MP3 file.
     """
