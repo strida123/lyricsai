@@ -215,7 +215,7 @@ def run_demucs_mdx_mp3(input_audio_path):
         "demucs",
         "--two-stems=vocals",
         "--mp3",
-        "-n", "mdx_extra_q",
+        "-n", "mdx_extra",
         "-o", output_dir,
         input_audio_path
     ]
