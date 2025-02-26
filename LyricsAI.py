@@ -203,14 +203,16 @@ def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
     return build_lyrics_srt_from_word_alignment(correct_lyrics_text, alignment, transcript_word_list)
 
 ########################################
-# Spleeter Preprocessing
+# Spleeter Preprocessing: isolate vocals -> vocals.wav -> convert to MP3
 ########################################
-def run_spleeter(input_audio_path):
+def run_spleeter_vocals_mp3(input_audio_path):
     """
-    Runs Spleeter 2-stems separation (vocals + accompaniment).
-    Returns the path to the resulting vocals.wav.
+    Runs Spleeter (2 stems) to separate vocals into vocals.wav,
+    then converts that to vocals.mp3 for Whisper.
+    Returns the path to vocals.mp3.
     """
     output_dir = tempfile.mkdtemp()
+    # Run Spleeter with 2 stems (vocals + accompaniment)
     cmd = [
         "spleeter", "separate",
         "-i", input_audio_path,
@@ -218,21 +220,17 @@ def run_spleeter(input_audio_path):
         "-p", "spleeter:2stems"
     ]
     subprocess.run(cmd, check=True)
-    # vocals.wav should appear in output_dir/<basename>/vocals.wav
+
+    # Spleeter outputs: output_dir/<basename>/vocals.wav
     basename = os.path.splitext(os.path.basename(input_audio_path))[0]
     vocals_wav = os.path.join(output_dir, basename, "vocals.wav")
-    return vocals_wav
 
-def convert_wav_to_mp3(wav_path):
-    """
-    Converts a WAV file to MP3 using ffmpeg. Returns the path to the MP3 file.
-    """
-    mp3_path = wav_path.replace(".wav", ".mp3")
-    cmd = [
-        "ffmpeg", "-y", "-i", wav_path, mp3_path
-    ]
-    subprocess.run(cmd, check=True)
-    return mp3_path
+    # Now convert vocals.wav -> vocals.mp3 using ffmpeg
+    vocals_mp3 = vocals_wav.replace(".wav", ".mp3")
+    cmd_ffmpeg = ["ffmpeg", "-y", "-i", vocals_wav, vocals_mp3]
+    subprocess.run(cmd_ffmpeg, check=True)
+
+    return vocals_mp3
 
 ########################################
 # Streamlit App
@@ -242,7 +240,7 @@ st.title("TVG LyricsAI")
 
 with st.sidebar:
     openai_api_key = st.text_input("OpenAI API Key", type="password")
-    use_spleeter = st.checkbox("Use Spleeter Vocal Isolation (2-stems)?")
+    use_spleeter = st.checkbox("Use Spleeter Vocal Isolation (preprocessing)?")
     "[Need an API key?](https://platform.openai.com/account/api-keys)"
 
 uploaded_audio = st.file_uploader(
@@ -257,20 +255,18 @@ if uploaded_audio:
         st.stop()
 
     if st.button("Generate SRT"):
-        # 1) Save uploaded audio to a temp .wav
+        # 1) Save the uploaded audio to a temp file
         audio_path = save_temp_file(uploaded_audio, ".wav")
         audio_basename = os.path.splitext(uploaded_audio.name)[0]
 
         # 2) Optionally run Spleeter
         if use_spleeter:
-            with st.spinner("Separating vocals with Spleeter..."):
-                vocals_wav = run_spleeter(audio_path)
-            with st.spinner("Converting vocals.wav to MP3..."):
-                processed_audio_path = convert_wav_to_mp3(vocals_wav)
+            with st.spinner("Running Spleeter (2 stems) to isolate vocals..."):
+                processed_audio_path = run_spleeter_vocals_mp3(audio_path)
         else:
             processed_audio_path = audio_path
 
-        # 3) Call Whisper on the processed audio
+        # 3) Transcribe with Whisper
         client = OpenAI(api_key=openai_api_key)
         with open(processed_audio_path, "rb") as audio_file:
             with st.spinner("Transcribing with Whisper..."):
@@ -281,7 +277,7 @@ if uploaded_audio:
                 )
         whisper_srt_str = whisper_result_srt
 
-        # 4) Align with lyrics if provided
+        # 4) If we have lyrics, align them
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
@@ -294,6 +290,7 @@ if uploaded_audio:
                 mime="application/zip"
             )
         else:
+            # No lyrics => raw Whisper SRT only
             zip_path = create_zip(audio_basename, whisper_srt_str, whisper_srt_str)
             st.warning("No lyrics pasted! Providing only raw Whisper SRT.")
             st.download_button(
