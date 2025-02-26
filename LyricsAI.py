@@ -1,5 +1,5 @@
 import streamlit as st
-from openai import OpenAI
+import openai
 import tempfile
 import os
 import srt
@@ -208,7 +208,7 @@ def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
 def run_spleeter_vocals_mp3(input_audio_path):
     """
     Runs Spleeter (2 stems) to separate vocals into vocals.wav,
-    then converts that to vocals.mp3 for Whisper.
+    then converts that to vocals.mp3 using ffmpeg.
     Returns the path to vocals.mp3.
     """
     output_dir = tempfile.mkdtemp()
@@ -225,7 +225,7 @@ def run_spleeter_vocals_mp3(input_audio_path):
     basename = os.path.splitext(os.path.basename(input_audio_path))[0]
     vocals_wav = os.path.join(output_dir, basename, "vocals.wav")
 
-    # Now convert vocals.wav -> vocals.mp3 using ffmpeg
+    # Convert vocals.wav -> vocals.mp3 using ffmpeg
     vocals_mp3 = vocals_wav.replace(".wav", ".mp3")
     cmd_ffmpeg = ["ffmpeg", "-y", "-i", vocals_wav, vocals_mp3]
     subprocess.run(cmd_ffmpeg, check=True)
@@ -266,18 +266,18 @@ if uploaded_audio:
         else:
             processed_audio_path = audio_path
 
-        # 3) Transcribe with Whisper
-        client = OpenAI(api_key=openai_api_key)
+        # 3) Set OpenAI API key and transcribe with Whisper
+        openai.api_key = openai_api_key
         with open(processed_audio_path, "rb") as audio_file:
             with st.spinner("Transcribing with Whisper..."):
-                whisper_result_srt = client.audio.transcriptions.create(
+                whisper_result_srt = openai.Audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
                     response_format="srt"
                 )
         whisper_srt_str = whisper_result_srt
 
-        # 4) If we have lyrics, align them
+        # 4) If lyrics are provided, align them
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
@@ -290,7 +290,6 @@ if uploaded_audio:
                 mime="application/zip"
             )
         else:
-            # No lyrics => raw Whisper SRT only
             zip_path = create_zip(audio_basename, whisper_srt_str, whisper_srt_str)
             st.warning("No lyrics pasted! Providing only raw Whisper SRT.")
             st.download_button(
