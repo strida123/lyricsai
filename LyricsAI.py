@@ -97,6 +97,7 @@ def word_alignment(transcript_words, lyric_words):
     Align transcript_words -> lyric_words with skipping allowed on both sides.
     transcript_words: list of (word, start_time, end_time)
     lyric_words: list of (word, line_idx)
+
     Return an array 'alignment' where alignment[i] = j means
     the i-th lyric word is matched with the j-th transcript word, or None if not matched.
     """
@@ -202,49 +203,27 @@ def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
     return build_lyrics_srt_from_word_alignment(correct_lyrics_text, alignment, transcript_word_list)
 
 ########################################
-# Demucs Preprocessing: isolate vocals and convert to mp3
+# Demucs Preprocessing: isolate vocals & produce MP3 directly
 ########################################
-def run_demucs(input_audio_path):
+def run_demucs_mdx_mp3(input_audio_path):
     """
-    Runs Demucs to separate vocals. Returns the path to the isolated vocals file.
-    This function runs Demucs via its CLI.
+    Runs Demucs with mdx_extra_q, outputting MP3. Returns the path to the vocals.mp3 file.
     """
-    # Create a temporary output directory
     output_dir = tempfile.mkdtemp()
-    # Run Demucs with two stems (vocals vs. accompaniment)
-    # Note: Adjust parameters if needed. This will output a folder named after the audio file (without extension)
+    # Use mdx_extra_q model, produce MP3
     cmd = [
         "demucs",
         "--two-stems=vocals",
+        "--mp3",
+        "-n", "mdx_extra_q",
         "-o", output_dir,
         input_audio_path
     ]
-    # Run Demucs capturing stdout/stderr
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    # Print logs in Streamlit to see what's happening
-    st.write("Demucs stdout:", result.stdout)
-    st.write("Demucs stderr:", result.stderr)
-    st.write("Demucs returncode:", result.returncode)
-
-    if result.returncode != 0:
-        st.error("Demucs command failed.")
-        return None
-
-    basename = os.path.splitext(os.path.basename(input_audio_path))[0]
-    vocals_wav = os.path.join(output_dir, basename, "vocals.wav")
-    return vocals_wav
-
-def convert_wav_to_mp3(wav_path):
-    """
-    Converts a WAV file to MP3 using ffmpeg. Returns the path to the MP3 file.
-    """
-    mp3_path = wav_path.replace(".wav", ".mp3")
-    cmd = [
-        "ffmpeg", "-y", "-i", wav_path, mp3_path
-    ]
     subprocess.run(cmd, check=True)
-    return mp3_path
+    # The resulting file is output_dir/<basename>/vocals.mp3
+    basename = os.path.splitext(os.path.basename(input_audio_path))[0]
+    vocals_mp3 = os.path.join(output_dir, basename, "vocals.mp3")
+    return vocals_mp3
 
 ########################################
 # Streamlit App
@@ -254,11 +233,13 @@ st.title("TVG LyricsAI")
 
 with st.sidebar:
     openai_api_key = st.text_input("OpenAI API Key", type="password")
-    use_demucs = st.checkbox("Use Demucs Vocal Isolation (preprocessing)?")
+    use_demucs = st.checkbox("Use Demucs Vocal Isolation (preprocessing)? (mdx_extra_q + MP3)")
     "[Need an API key?](https://platform.openai.com/account/api-keys)"
 
-uploaded_audio = st.file_uploader("Upload Audio File", 
-                                  type=["flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm"])
+uploaded_audio = st.file_uploader(
+    "Upload Audio File", 
+    type=["flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm"]
+)
 lyrics_input = st.text_area("Paste Lyrics")
 
 if uploaded_audio:
@@ -267,20 +248,18 @@ if uploaded_audio:
         st.stop()
 
     if st.button("Generate SRT"):
-        # 1) Save the audio file
+        # 1) Save the uploaded audio to a temp file
         audio_path = save_temp_file(uploaded_audio, ".wav")
         audio_basename = os.path.splitext(uploaded_audio.name)[0]
 
-        # 2) Optionally run Demucs preprocessing
+        # 2) Optionally run Demucs
         if use_demucs:
             with st.spinner("Running Demucs to isolate vocals..."):
-                vocals_wav = run_demucs(audio_path)
-            with st.spinner("Converting isolated vocals to MP3..."):
-                processed_audio_path = convert_wav_to_mp3(vocals_wav)
+                processed_audio_path = run_demucs_mdx_mp3(audio_path)
         else:
             processed_audio_path = audio_path
 
-        # 3) Call Whisper on the processed audio
+        # 3) Transcribe with Whisper
         client = OpenAI(api_key=openai_api_key)
         with open(processed_audio_path, "rb") as audio_file:
             with st.spinner("Transcribing with Whisper..."):
@@ -291,7 +270,7 @@ if uploaded_audio:
                 )
         whisper_srt_str = whisper_result_srt
 
-        # 4) If lyrics are provided, align to them
+        # 4) If we have lyrics, align them
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
@@ -304,6 +283,7 @@ if uploaded_audio:
                 mime="application/zip"
             )
         else:
+            # No lyrics => raw Whisper SRT only
             zip_path = create_zip(audio_basename, whisper_srt_str, whisper_srt_str)
             st.warning("No lyrics pasted! Providing only raw Whisper SRT.")
             st.download_button(
@@ -312,4 +292,3 @@ if uploaded_audio:
                 file_name="transcribed.zip",
                 mime="application/zip"
             )
-
