@@ -270,7 +270,7 @@ if uploaded_audio:
         openai.api_key = openai_api_key
         with open(processed_audio_path, "rb") as audio_file:
             with st.spinner("Transcribing with Whisper..."):
-                whisper_result_srt = openai.Audio.transcriptions.create(
+                whisper_result_srt = openai.Audio.transcribe(
                     model="whisper-1",
                     file=audio_file,
                     response_format="srt"
