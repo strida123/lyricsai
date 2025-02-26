@@ -1,5 +1,4 @@
 streamlit
+openai
 srt
-openai 
-demucs
-diffq
+spleeter
