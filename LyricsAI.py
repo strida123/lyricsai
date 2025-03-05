@@ -33,7 +33,6 @@ def run_demucs_vocals_mp3(input_audio_path):
         "demucs",  # ensure demucs is installed
         input_audio_path,
         "-o", output_dir,
-        "--two-stems", "vocals"
     ]
     subprocess.run(cmd_demucs, check=True)
 
