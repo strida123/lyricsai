@@ -20,42 +20,45 @@ def save_temp_file(uploaded_file, suffix):
 ########################################
 # 2) Demucs Preprocessing
 ########################################
-def run_demucs_vocals_mp3(input_audio_path):
+def run_demucs_vocals_mp3(input_audio_path, two_stems=True):
     """
-    Runs Demucs in 2-stem mode to isolate vocals into vocals.wav,
-    then converts that to vocals.mp3.
-    Returns the path to vocals.mp3.
+    Runs Demucs either in 2-stem mode (vocals + no_vocals) or 4-stem mode:
+      - If two_stems=True => use:   demucs <file> --two-stems vocals
+      - If two_stems=False => use: demucs <file> (4 stems)
+    Then converts 'vocals.wav' -> 'vocals.mp3'.
+    
+    Returns the path to 'vocals.mp3'.
     """
     output_dir = tempfile.mkdtemp()
-    # 1) Run Demucs CLI with 2-stems: 'vocals'
-    #    This will output e.g. output_dir/<model_name>/<basename>/vocals.wav
+
+    # Build the Demucs command
     cmd_demucs = [
-        "demucs",  # ensure demucs is installed
+        "demucs",
         input_audio_path,
-        "-o", output_dir,
-        "--two-stems", "vocals"
+        "-o", output_dir
     ]
+    if two_stems:
+        # 2-stem separation => vocals + no_vocals
+        cmd_demucs += ["--two-stems", "vocals"]
+
     subprocess.run(cmd_demucs, check=True)
 
     # By default, Demucs organizes outputs like:
-    #   output_dir/<model_name>/<BASE_FILENAME>/{vocals.wav, no_vocals.wav}
-    # We'll find that folder:
-    #  - The <model_name> folder name is variable (ex: 'htdemucs_ft')
-    #  - Then inside it, there's <basename>/vocals.wav
+    #   output_dir/<model_name>/<basename>/{vocals.wav, no_vocals.wav}   (2-stem)
+    # or
+    #   output_dir/<model_name>/<basename>/{vocals.wav, bass.wav, drums.wav, other.wav}  (4-stem)
+    # We'll find vocals.wav:
 
-    basename = os.path.splitext(os.path.basename(input_audio_path))[0]
-    # We'll search output_dir recursively for "vocals.wav".
     vocals_wav_path = None
     for root, dirs, files in os.walk(output_dir):
         if "vocals.wav" in files:
-            # Found it
             vocals_wav_path = os.path.join(root, "vocals.wav")
             break
 
     if not vocals_wav_path or not os.path.exists(vocals_wav_path):
-        raise FileNotFoundError("vocals.wav not found after running Demucs.")
+        raise FileNotFoundError("vocals.wav not found after Demucs.")
 
-    # 2) Convert that WAV -> MP3
+    # Convert that WAV -> MP3
     vocals_mp3 = vocals_wav_path.replace(".wav", ".mp3")
     cmd_ffmpeg = ["ffmpeg", "-y", "-i", vocals_wav_path, vocals_mp3]
     subprocess.run(cmd_ffmpeg, check=True)
@@ -200,7 +203,7 @@ def build_lyrics_srt_from_word_alignment(lyrics_text, alignment, transcript_word
 def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
     transcript_word_list = srt_to_word_timestamps(whisper_srt_str)
     lyric_word_list, _ = lyrics_to_word_list(correct_lyrics_text)
-    alignment = word_alignment(transcript_word_list, lyric_word_list)
+    alignment = word_alignment(transcript_words=transcript_word_list, lyric_words=lyric_word_list)
     return build_lyrics_srt_from_word_alignment(correct_lyrics_text, alignment, transcript_word_list)
 
 ########################################
@@ -212,6 +215,10 @@ st.title("TVG LyricsAI + Demucs")
 with st.sidebar:
     openai_api_key = st.text_input("OpenAI API Key", type="password")
     use_demucs = st.checkbox("Use Demucs Vocal Isolation (preprocessing)?")
+    # If user checks to use demucs, let them pick 2 or 4 stems
+    if use_demucs:
+        stems_choice = st.selectbox("Number of stems:", ["2 stems (vocals)", "4 stems (vocals/bass/drums/other)"])
+
     st.markdown("[Need an API key?](https://platform.openai.com/account/api-keys)")
 
 uploaded_audio = st.file_uploader(
@@ -226,23 +233,38 @@ if uploaded_audio:
         st.stop()
 
     if st.button("Generate SRT"):
-        # Step 1: Save audio to temp
-        audio_path = save_temp_file(uploaded_audio, ".wav")  # or .mp3, but .wav is okay
+        # 1) Save audio to temp
+        audio_path = save_temp_file(uploaded_audio, ".wav")
+        audio_basename = os.path.splitext(uploaded_audio.name)[0]
 
-        # Step 2: If Demucs is checked, isolate vocals -> mp3
+        # 2) If demucs is chosen
         if use_demucs:
-            with st.spinner("Running Demucs to isolate vocals..."):
-                demucs_mp3_path = run_demucs_vocals_mp3(audio_path)
-            processed_path = demucs_mp3_path
+            # Figure out if user wants 2 stems or 4 stems
+            is_two_stems = stems_choice.startswith("2")  # simple check
+            with st.spinner("Running Demucs..."):
+                # We'll slightly modify run_demucs_vocals_mp3 so it can do 4 stems
+                vocals_mp3_path = run_demucs_vocals_mp3(
+                    input_audio_path=audio_path,
+                    two_stems=is_two_stems
+                )
+
+            processed_path = vocals_mp3_path
             mime_type = "audio/mpeg"
+
+            # Provide a download for the vocals track:
+            with open(vocals_mp3_path, "rb") as vf:
+                st.download_button(
+                    "Download Isolated Vocals (MP3)",
+                    data=vf,
+                    file_name=f"{audio_basename}_vocals.mp3",
+                    mime="audio/mpeg"
+                )
         else:
-            # Just pass the original wav along
+            # No demucs
             processed_path = audio_path
             mime_type = "audio/wav"
 
-        audio_basename = os.path.splitext(uploaded_audio.name)[0]
-
-        # Step 3: Transcribe with Whisper via direct HTTP
+        # 3) Whisper request
         whisper_url = "https://api.openai.com/v1/audio/transcriptions"
         headers = {
             "Authorization": f"Bearer {openai_api_key}",
@@ -258,7 +280,7 @@ if uploaded_audio:
                 response.raise_for_status()
             whisper_srt_str = response.text
 
-        # Step 4: If user provided lyrics, align them; else return raw SRT
+        # 4) If lyrics exist, do alignment; else raw SRT
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
