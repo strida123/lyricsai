@@ -1,15 +1,12 @@
 import streamlit as st
-import requests
+import openai
+import tempfile
+import os
 import srt
 import zipfile
 import math
-import tempfile
-import os
 import subprocess
 from datetime import timedelta
-
-# ---- Spleeter stuff
-from spleeter.separator import Separator
 
 ########################################
 # 1) Save uploaded file
@@ -21,32 +18,7 @@ def save_temp_file(uploaded_file, suffix):
     return temp_file.name
 
 ########################################
-# 2) Spleeter Preprocessing: Isolate Vocals -> Convert to MP3
-########################################
-def spleeter_vocals_to_mp3(input_audio_path):
-    """
-    Splits 'input_audio_path' into vocals & accompaniment.
-    Writes 'vocals.wav' into a temp folder, then converts to 'vocals.mp3'.
-    Returns the path to 'vocals.mp3'.
-    """
-    output_dir = tempfile.mkdtemp()
-    # 1) Use Spleeter's Python API for 2 stems (vocals + accompaniment).
-    separator = Separator('spleeter:2stems')
-    separator.separate_to_file(input_audio_path, output_dir)
-    
-    # 2) Spleeter will write 'vocals.wav' to a subfolder named after the base file
-    basename = os.path.splitext(os.path.basename(input_audio_path))[0]
-    vocals_wav = os.path.join(output_dir, basename, "vocals.wav")
-    
-    # 3) Convert WAV -> MP3 using ffmpeg
-    vocals_mp3 = vocals_wav.replace(".wav", ".mp3")
-    cmd_ffmpeg = ["ffmpeg", "-y", "-i", vocals_wav, vocals_mp3]
-    subprocess.run(cmd_ffmpeg, check=True)
-    
-    return vocals_mp3
-
-########################################
-# 3) Make ZIP with original + final
+# 2) Make ZIP with original + final
 ########################################
 def create_zip(audio_basename, original_srt_str, aligned_srt_str):
     """
@@ -62,29 +34,41 @@ def create_zip(audio_basename, original_srt_str, aligned_srt_str):
     return zip_path
 
 ########################################
-# 4) Convert Whisper SRT → word timestamps
+# 3) Convert Whisper SRT to word timestamps
 ########################################
 def srt_to_word_timestamps(srt_text):
+    """
+    Parse the Whisper SRT into a flat list of (word, start_time, end_time).
+    We'll naively distribute the subtitle's time range across its words.
+    """
     subs = list(srt.parse(srt_text))
     word_entries = []
+
     for sub in subs:
         sub_text = sub.content.strip()
         words = sub_text.split()
         if not words:
             continue
+
         total_sub_duration = (sub.end - sub.start).total_seconds()
         dur_per_word = total_sub_duration / len(words) if len(words) else 0
+
         for i, w in enumerate(words):
             w_start = sub.start + timedelta(seconds=i * dur_per_word)
             w_end   = sub.start + timedelta(seconds=(i+1) * dur_per_word)
             word_entries.append((w, w_start, w_end))
+    
     return word_entries
 
 ########################################
-# 5) Flatten lyrics → word list
+# 4) Flatten lyrics -> word list
 ########################################
 def lyrics_to_word_list(lyrics_text):
-    lines = lyrics_text.split('\n')
+    """
+    Returns a list of (word, line_index) while preserving empty lines.
+    Empty lines become lines with zero words, so they won't produce subtitles.
+    """
+    lines = lyrics_text.split('\n')  # keep empty lines
     word_list = []
     for line_idx, line in enumerate(lines):
         words = line.strip().split()
@@ -96,19 +80,33 @@ def lyrics_to_word_list(lyrics_text):
 # Normalization Helper
 ########################################
 def normalize_word(word):
+    """
+    Lowercase, replace hyphens with spaces, remove non-alphanumeric except spaces,
+    and strip leading/trailing whitespace.
+    """
     w = word.lower()
     w = w.replace('-', ' ')
     w = ''.join(ch for ch in w if ch.isalnum() or ch.isspace())
     return w.strip()
 
 ########################################
-# 6) Word-level alignment (DP)
+# 5) Word-level alignment (DP)
 ########################################
 def word_alignment(transcript_words, lyric_words):
+    """
+    Align transcript_words -> lyric_words with skipping allowed on both sides.
+    transcript_words: list of (word, start_time, end_time)
+    lyric_words: list of (word, line_idx)
+
+    Return an array 'alignment' where alignment[i] = j means
+    the i-th lyric word is matched with the j-th transcript word, or None if not matched.
+    """
     T = len(transcript_words)
     L = len(lyric_words)
+
     dp = [[(math.inf, None) for _ in range(T+1)] for _ in range(L+1)]
     dp[0][0] = (0, None)
+
     skip_penalty = 1
 
     def cost_function(lyric_word, transcript_word):
@@ -121,16 +119,19 @@ def word_alignment(transcript_words, lyric_words):
             (curr_cost, _) = dp[i][j]
             if curr_cost == math.inf:
                 continue
-            # skip lyric
+
+            # skip lyric word
             if i < L:
                 scost = curr_cost + skip_penalty
                 if scost < dp[i+1][j][0]:
                     dp[i+1][j] = (scost, (i, j))
-            # skip transcript
+
+            # skip transcript word
             if j < T:
                 scost = curr_cost + skip_penalty
                 if scost < dp[i][j+1][0]:
                     dp[i][j+1] = (scost, (i, j))
+
             # match
             if i < L and j < T:
                 cst = cost_function(lyric_words[i][0], transcript_words[j][0])
@@ -145,17 +146,20 @@ def word_alignment(transcript_words, lyric_words):
         if backptr is None:
             break
         pi, pj = backptr
+        # matched
         if pi == i-1 and pj == j-1:
             alignment[i-1] = j-1
         i, j = pi, pj
+
     return alignment
 
 ########################################
-# 7) Build final SRT from alignment
+# 6) Build final SRT from alignment
 ########################################
 def build_lyrics_srt_from_word_alignment(lyrics_text, alignment, transcript_words):
-    lines = [l.strip() for l in lyrics_text.split('\n')]
+    lines = [l.strip() for l in lyrics_text.split('\n')]  # keep even empty lines (striped form)
     lyric_word_list, _ = lyrics_to_word_list(lyrics_text)
+
     line_to_word_indices = {}
     for i, (w, line_idx) in enumerate(lyric_word_list):
         if alignment[i] is not None:
@@ -166,12 +170,15 @@ def build_lyrics_srt_from_word_alignment(lyrics_text, alignment, transcript_word
 
     srt_entries = []
     idx_counter = 1
+
     for line_idx, line_text in enumerate(lines):
         matched_indices = line_to_word_indices.get(line_idx, [])
         if not matched_indices:
+            # no matched words => no subtitle
             continue
         start_time = min(transcript_words[mx][1] for mx in matched_indices)
         end_time   = max(transcript_words[mx][2] for mx in matched_indices)
+
         subtitle = srt.Subtitle(
             index=idx_counter,
             start=start_time,
@@ -180,11 +187,12 @@ def build_lyrics_srt_from_word_alignment(lyrics_text, alignment, transcript_word
         )
         srt_entries.append(subtitle)
         idx_counter += 1
+
     srt_entries.sort(key=lambda x: x.start)
     return srt.compose(srt_entries)
 
 ########################################
-# 8) Main alignment function
+# 7) Main function to create lyrics-driven SRT
 ########################################
 def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
     transcript_word_list = srt_to_word_timestamps(whisper_srt_str)
@@ -193,20 +201,50 @@ def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
     return build_lyrics_srt_from_word_alignment(correct_lyrics_text, alignment, transcript_word_list)
 
 ########################################
+# Spleeter Preprocessing
+########################################
+def run_spleeter_vocals_mp3(input_audio_path):
+    """
+    Runs Spleeter (2 stems) to separate vocals into vocals.wav,
+    then converts that to vocals.mp3 using ffmpeg.
+    Returns the path to vocals.mp3.
+    """
+    output_dir = tempfile.mkdtemp()
+    # 1) Spleeter CLI for 2 stems
+    cmd = [
+        "spleeter", "separate",
+        "-i", input_audio_path,
+        "-o", output_dir,
+        "-p", "spleeter:2stems"
+    ]
+    subprocess.run(cmd, check=True)
+
+    basename = os.path.splitext(os.path.basename(input_audio_path))[0]
+    vocals_wav = os.path.join(output_dir, basename, "vocals.wav")
+
+    # 2) Convert WAV -> MP3
+    vocals_mp3 = vocals_wav.replace(".wav", ".mp3")
+    cmd_ffmpeg = ["ffmpeg", "-y", "-i", vocals_wav, vocals_mp3]
+    subprocess.run(cmd_ffmpeg, check=True)
+
+    return vocals_mp3
+
+########################################
 # Streamlit App
 ########################################
 st.set_page_config(layout="wide")
-st.title("TVG LyricsAI with Spleeter")
+st.title("TVG LyricsAI")
 
 with st.sidebar:
     openai_api_key = st.text_input("OpenAI API Key", type="password")
-    st.markdown("[Need an API key?](https://platform.openai.com/account/api-keys)")
+    use_spleeter = st.checkbox("Use Spleeter Vocal Isolation (preprocessing)?")
+    "[Need an API key?](https://platform.openai.com/account/api-keys)"
 
 uploaded_audio = st.file_uploader(
-    "Upload Audio File (e.g. MP3)",
+    "Upload Audio File",
     type=["flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm"]
 )
-lyrics_input = st.text_area("Paste Lyrics (optional)")
+lyrics_input = st.text_area("Paste Lyrics")
 
 if uploaded_audio:
     if not openai_api_key:
@@ -214,34 +252,34 @@ if uploaded_audio:
         st.stop()
 
     if st.button("Generate SRT"):
-        # Step 1: Save uploaded audio to temp
-        audio_path = save_temp_file(uploaded_audio, ".mp3")
+        # 1) Save input audio to temp
+        audio_path = save_temp_file(uploaded_audio, ".wav")
         audio_basename = os.path.splitext(uploaded_audio.name)[0]
 
-        # Step 2: Run Spleeter to isolate vocals, produce vocals.mp3
-        with st.spinner("Isolating vocals via Spleeter..."):
-            processed_mp3_path = spleeter_vocals_to_mp3(audio_path)
+        # 2) Optionally run Spleeter
+        if use_spleeter:
+            with st.spinner("Running Spleeter (2 stems) to isolate vocals..."):
+                processed_audio_path = run_spleeter_vocals_mp3(audio_path)
+        else:
+            processed_audio_path = audio_path
 
-        # Step 3: Call Whisper via direct HTTP request
-        url = "https://api.openai.com/v1/audio/transcriptions"
-        headers = {
-            "Authorization": f"Bearer {openai_api_key}",
-        }
-        data = {
-            "model": "whisper-1",
-            "response_format": "srt",
-        }
-        with st.spinner("Transcribing vocals with Whisper..."):
-            with open(processed_mp3_path, "rb") as f:
-                files = {"file": (os.path.basename(processed_mp3_path), f, "audio/mpeg")}
-                response = requests.post(url, headers=headers, files=files, data=data)
-                response.raise_for_status()
-            whisper_srt_str = response.text
+        # 3) Transcribe with the older openai library
+        openai.api_key = openai_api_key
+        with open(processed_audio_path, "rb") as audio_file:
+            with st.spinner("Transcribing with Whisper..."):
+                # For library <1.0.0:
+                whisper_result_srt = openai.Audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="srt"
+                )
+        whisper_srt_str = whisper_result_srt
 
-        # Step 4: If user pasted lyrics, align them. Otherwise, just return raw SRT
+        # 4) Align if user supplied lyrics
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
+            
             zip_path = create_zip(audio_basename, whisper_srt_str, final_srt_str)
             st.success("Done! Download your SRT files below.")
             st.download_button(
@@ -251,6 +289,7 @@ if uploaded_audio:
                 mime="application/zip"
             )
         else:
+            # Provide only raw SRT if no lyrics given
             zip_path = create_zip(audio_basename, whisper_srt_str, whisper_srt_str)
             st.warning("No lyrics pasted! Providing only raw Whisper SRT.")
             st.download_button(
