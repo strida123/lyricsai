@@ -1,6 +1,6 @@
 streamlit
 requests
 srt
-spleeter==2.1.0
-tensorflow==2.8.0
-protobuf==3.19.6
+spleeter
+tensorflow
+protobuf
