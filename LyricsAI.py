@@ -22,43 +22,32 @@ def save_temp_file(uploaded_file, suffix):
 ########################################
 def run_demucs_vocals_mp3(input_audio_path, two_stems=True):
     """
-    Runs Demucs either in 2-stem mode (vocals + no_vocals) or 4-stem mode:
-      - If two_stems=True => use:   demucs <file> --two-stems vocals
-      - If two_stems=False => use: demucs <file> (4 stems)
-    Then converts 'vocals.wav' -> 'vocals.mp3'.
-    
-    Returns the path to 'vocals.mp3'.
+    If two_stems=True => 2-stem (vocals + no_vocals).
+    If two_stems=False => 4-stem default (vocals, drums, bass, other).
+    Converts the resulting vocals.wav -> vocals.mp3 and returns that path.
     """
     output_dir = tempfile.mkdtemp()
 
-    # Build the Demucs command
     cmd_demucs = [
         "demucs",
         input_audio_path,
-        "-o", output_dir
+        "-o", output_dir,
     ]
     if two_stems:
-        # 2-stem separation => vocals + no_vocals
         cmd_demucs += ["--two-stems", "vocals"]
 
     subprocess.run(cmd_demucs, check=True)
 
-    # By default, Demucs organizes outputs like:
-    #   output_dir/<model_name>/<basename>/{vocals.wav, no_vocals.wav}   (2-stem)
-    # or
-    #   output_dir/<model_name>/<basename>/{vocals.wav, bass.wav, drums.wav, other.wav}  (4-stem)
-    # We'll find vocals.wav:
-
+    # locate vocals.wav
     vocals_wav_path = None
     for root, dirs, files in os.walk(output_dir):
         if "vocals.wav" in files:
             vocals_wav_path = os.path.join(root, "vocals.wav")
             break
 
-    if not vocals_wav_path or not os.path.exists(vocals_wav_path):
+    if not vocals_wav_path:
         raise FileNotFoundError("vocals.wav not found after Demucs.")
 
-    # Convert that WAV -> MP3
     vocals_mp3 = vocals_wav_path.replace(".wav", ".mp3")
     cmd_ffmpeg = ["ffmpeg", "-y", "-i", vocals_wav_path, vocals_mp3]
     subprocess.run(cmd_ffmpeg, check=True)
@@ -135,16 +124,18 @@ def word_alignment(transcript_words, lyric_words):
             (curr_cost, _) = dp[i][j]
             if curr_cost == math.inf:
                 continue
-            # skip lyric
+
+            # skip lyric word
             if i < L:
                 scost = curr_cost + skip_penalty
                 if scost < dp[i+1][j][0]:
                     dp[i+1][j] = (scost, (i, j))
-            # skip transcript
+            # skip transcript word
             if j < T:
                 scost = curr_cost + skip_penalty
                 if scost < dp[i][j+1][0]:
                     dp[i][j+1] = (scost, (i, j))
+
             # match
             if i < L and j < T:
                 cst = cost_function(lyric_words[i][0], transcript_words[j][0])
@@ -203,21 +194,31 @@ def build_lyrics_srt_from_word_alignment(lyrics_text, alignment, transcript_word
 def lyrics_driven_srt(whisper_srt_str, correct_lyrics_text):
     transcript_word_list = srt_to_word_timestamps(whisper_srt_str)
     lyric_word_list, _ = lyrics_to_word_list(correct_lyrics_text)
-    alignment = word_alignment(transcript_words=transcript_word_list, lyric_words=lyric_word_list)
+    alignment = word_alignment(transcript_word_list, lyric_word_list)
     return build_lyrics_srt_from_word_alignment(correct_lyrics_text, alignment, transcript_word_list)
 
 ########################################
 # Streamlit App
 ########################################
+
 st.set_page_config(layout="wide")
-st.title("TVG LyricsAI")
+st.title("TVG LyricsAI + Demucs")
+
+# We'll store final data in st.session_state so it doesn't vanish on re-runs
+if "vocals_bytes" not in st.session_state:
+    st.session_state.vocals_bytes = None
+if "srt_zip_bytes" not in st.session_state:
+    st.session_state.srt_zip_bytes = None
 
 with st.sidebar:
     openai_api_key = st.text_input("OpenAI API Key", type="password")
-    use_demucs = st.checkbox("Use Vocal Isolation?")
-    # If user checks to use demucs, let them pick 2 or 4 stems
+    use_demucs = st.checkbox("Use Demucs Vocal Isolation (preprocessing)?")
+
+    # Let them pick 2 or 4 stems only if they are using Demucs
     if use_demucs:
         stems_choice = st.selectbox("Number of stems:", ["2 stems (vocals)", "4 stems (vocals/bass/drums/other)"])
+    else:
+        stems_choice = None
 
     st.markdown("[Need an API key?](https://platform.openai.com/account/api-keys)")
 
@@ -233,38 +234,38 @@ if uploaded_audio:
         st.stop()
 
     if st.button("Generate SRT"):
-        # 1) Save audio to temp
+        # Reset stored data so each run is fresh
+        st.session_state.vocals_bytes = None
+        st.session_state.srt_zip_bytes = None
+
+        # Step 1: Save audio to temp
         audio_path = save_temp_file(uploaded_audio, ".wav")
         audio_basename = os.path.splitext(uploaded_audio.name)[0]
 
-        # 2) If demucs is chosen
+        # Step 2: If Demucs is chosen, isolate vocals -> mp3
+        # Decide 2 or 4 stems
         if use_demucs:
-            # Figure out if user wants 2 stems or 4 stems
-            is_two_stems = stems_choice.startswith("2")  # simple check
+            two_stems = True
+            if stems_choice and stems_choice.startswith("4"):
+                two_stems = False
+
             with st.spinner("Running Demucs..."):
-                # We'll slightly modify run_demucs_vocals_mp3 so it can do 4 stems
                 vocals_mp3_path = run_demucs_vocals_mp3(
                     input_audio_path=audio_path,
-                    two_stems=is_two_stems
+                    two_stems=two_stems
                 )
+
+            # Save the vocals in session_state for later downloads
+            with open(vocals_mp3_path, "rb") as vf:
+                st.session_state.vocals_bytes = vf.read()
 
             processed_path = vocals_mp3_path
             mime_type = "audio/mpeg"
-
-            # Provide a download for the vocals track:
-            with open(vocals_mp3_path, "rb") as vf:
-                st.download_button(
-                    "Download Isolated Vocals (MP3)",
-                    data=vf,
-                    file_name=f"{audio_basename}_vocals.mp3",
-                    mime="audio/mpeg"
-                )
         else:
-            # No demucs
             processed_path = audio_path
             mime_type = "audio/wav"
 
-        # 3) Whisper request
+        # Step 3: Transcribe with Whisper
         whisper_url = "https://api.openai.com/v1/audio/transcriptions"
         headers = {
             "Authorization": f"Bearer {openai_api_key}",
@@ -280,24 +281,35 @@ if uploaded_audio:
                 response.raise_for_status()
             whisper_srt_str = response.text
 
-        # 4) If lyrics exist, do alignment; else raw SRT
+        # Step 4: If user gave lyrics, align them
         if lyrics_input.strip():
             with st.spinner("Aligning to your pasted lyrics..."):
                 final_srt_str = lyrics_driven_srt(whisper_srt_str, lyrics_input)
+            # Create ZIP
             zip_path = create_zip(audio_basename, whisper_srt_str, final_srt_str)
-            st.success("Done! Download your SRT files below.")
-            st.download_button(
-                "Download SRTs (ZIP)",
-                data=open(zip_path, "rb"),
-                file_name="srt_files.zip",
-                mime="application/zip"
-            )
         else:
+            # Provide raw SRT in both slots
             zip_path = create_zip(audio_basename, whisper_srt_str, whisper_srt_str)
-            st.warning("No lyrics pasted! Providing only raw Whisper SRT.")
-            st.download_button(
-                "Download Raw Whisper SRT (ZIP)",
-                data=open(zip_path, "rb"),
-                file_name="transcribed.zip",
-                mime="application/zip"
-            )
+
+        # Store that zip data in session_state so the button persists
+        with open(zip_path, "rb") as zf:
+            st.session_state.srt_zip_bytes = zf.read()
+
+        st.success("Done! Check below for your downloads.")
+
+# Now show the buttons for downloads, if data is present:
+if st.session_state.vocals_bytes:
+    st.download_button(
+        "Download Isolated Vocals (MP3)",
+        data=st.session_state.vocals_bytes,
+        file_name="vocals.mp3",
+        mime="audio/mpeg"
+    )
+
+if st.session_state.srt_zip_bytes:
+    st.download_button(
+        "Download SRT Files (ZIP)",
+        data=st.session_state.srt_zip_bytes,
+        file_name="srt_files.zip",
+        mime="application/zip"
+    )
