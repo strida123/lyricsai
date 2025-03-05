@@ -2,3 +2,4 @@ streamlit
 srt
 requests
 demucs
+diffq
