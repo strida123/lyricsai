@@ -168,7 +168,9 @@ if up_audio and st.button("Generate SRT"):
         st.warning("Add your API key.")
         st.stop()
 
-    st.session_state.vocals_bytes = st.session_state.zip_bytes = None
+    st.session_state.vocals_bytes = None
+    st.session_state.zip_bytes = None
+
     file_ext = os.path.splitext(up_audio.name)[1] or ".wav"
     audio_path = save_temp_file(up_audio, file_ext)
     base = os.path.splitext(up_audio.name)[0]
@@ -197,40 +199,4 @@ if up_audio and st.button("Generate SRT"):
             resp = requests.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers=headers,
-                files={"file": (os.path.basename(proc_path), f, mime)},
-                data=data,
-            )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as e:
-            st.error(f"OpenAI error: {resp.text or e}")
-            st.stop()
-
-    original_srt, trans_words = json_to_srt_and_words(resp.text)
-
-    # Lyrics alignment (optional)
-    if lyrics_txt.strip():
-        with st.spinner("Aligning lyrics …"):
-            final_srt = align_lyrics(trans_words, lyrics_txt)
-    else:
-        final_srt = original_srt
-
-    # Package ZIP
-    zip_path = create_zip(base, original_srt, final_srt)
-    with open(zip_path, "rb") as z:
-        st.session_state.zip_bytes = z.read()
-
-    st.success("All done! Downloads below ↓")
-
-# ─────────────────────────  Download buttons  ───────────────────────────────
-
-if st.session_state.vocals_bytes:
-    st.download_button(
-        "Download isolated vocals (MP3)",
-        st.session_state.vocals_bytes,
-        "vocals.mp3",
-        "audio/mpeg",
-    )
-
-if st.session_state.zip_bytes:
-    st
+                files={"file": (
