@@ -173,104 +173,172 @@ def lyrics_driven_srt(whisper_srt: str, lyrics: str):
     alignment = word_alignment(transcript_word_list, lyric_word_list)
     return build_lyrics_srt_from_word_alignment(lyrics, alignment, transcript_word_list)
 
-########################################
-# Streamlit App – updated for GPT‑4o‑Transcribe
-########################################
-
-st.set_page_config(layout="wide")
-st.title("TVG LyricsAI + Demucs  |  Powered by GPT‑4o‑Transcribe")
-
-if "vocals_bytes" not in st.session_state:
-    st.session_state.vocals_bytes = None
-if "srt_zip_bytes" not in st.session_state:
-    st.session_state.srt_zip_bytes = None
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  TVG LyricsAI + Demucs    —  now using GPT-4o-transcribe for speech-to-text
+# ──────────────────────────────────────────────────────────────────────────────
+import streamlit as st, requests, json, tempfile, os, srt, zipfile, math, subprocess
+from datetime import timedelta
+# ──────────────────────────  Utility: temporary files  ────────────────────────
+def save_temp_file(uploaded_file, suffix):
+    fn = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    fn.write(uploaded_file.getvalue()); fn.close()
+    return fn.name
+# ──────────────────────────  Demucs isolation  ───────────────────────────────
+def run_demucs_vocals_mp3(input_path, two_stems=True):
+    out_dir = tempfile.mkdtemp()
+    cmd = ["demucs", input_path, "-o", out_dir]
+    if two_stems: cmd += ["--two-stems", "vocals"]
+    subprocess.run(cmd, check=True)
+    # locate vocals.wav produced by Demucs
+    vocals_wav = next(
+        (os.path.join(r, "vocals.wav") for r,_,f in os.walk(out_dir) if "vocals.wav" in f),
+        None
+    )
+    if not vocals_wav:
+        raise FileNotFoundError("Demucs finished but vocals.wav not found.")
+    vocals_mp3 = vocals_wav.replace(".wav", ".mp3")
+    subprocess.run(["ffmpeg", "-y", "-i", vocals_wav, vocals_mp3], check=True)
+    return vocals_mp3
+# ──────────────────────────  ZIP helper  ──────────────────────────────────────
+def create_zip(basename, original_srt, aligned_srt):
+    zpath = tempfile.NamedTemporaryFile(delete=False, suffix=".zip").name
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.writestr(f"{basename}_transcription.srt", original_srt)
+        z.writestr(f"{basename}_corrected_transcription.srt", aligned_srt)
+    return zpath
+# ──────────────────────────  JSON → SRT  ──────────────────────────────────────
+def json_to_srt_and_words(json_str):
+    obj = json.loads(json_str)
+    entries, word_list, idx = [], [], 1
+    for seg in obj.get("segments", []):
+        start = timedelta(seconds=seg["start"])
+        end   = timedelta(seconds=seg["end"])
+        txt   = seg["text"].strip()
+        entries.append(srt.Subtitle(idx, start, end, txt)); idx += 1
+        # word-level (if present)
+        for w in seg.get("words", []):
+            word_list.append((w["word"], timedelta(seconds=w["start"]),
+                              timedelta(seconds=w["end"])))
+    srt_str = srt.compose(entries)
+    # if words array missing, fall back to per-segment coarse timing
+    if not word_list:
+        for e in entries:
+            words = e.content.split()
+            dur = (e.end - e.start).total_seconds() / max(len(words), 1)
+            for i, w in enumerate(words):
+                word_list.append((w,
+                                  e.start + timedelta(seconds=i*dur),
+                                  e.start + timedelta(seconds=(i+1)*dur)))
+    return srt_str, word_list
+# ──────────────────────────  Lyrics alignment helpers  ────────────────────────
+def normalize_word(w): return ''.join(ch for ch in w.lower().replace('-', ' ')
+                                      if ch.isalnum() or ch.isspace()).strip()
+def lyrics_to_word_list(txt):
+    lines, out = txt.splitlines(), []
+    for li,line in enumerate(lines):
+        for w in line.strip().split(): out.append((w, li))
+    return out, lines
+def word_alignment(trans_words, lyric_words):
+    T,L = len(trans_words), len(lyric_words); skip = 1
+    dp = [[(math.inf,None) for _ in range(T+1)] for _ in range(L+1)]
+    dp[0][0]=(0,None)
+    cost=lambda lw,tw:0 if normalize_word(lw)==normalize_word(tw) else 1
+    for i in range(L+1):
+        for j in range(T+1):
+            c,_ = dp[i][j]
+            if c==math.inf: continue
+            if i<L and c+skip<dp[i+1][j][0]: dp[i+1][j]=(c+skip,(i,j))
+            if j<T and c+skip<dp[i][j+1][0]: dp[i][j+1]=(c+skip,(i,j))
+            if i<L and j<T:
+                nc=c+cost(lyric_words[i][0], trans_words[j][0])
+                if nc<dp[i+1][j+1][0]: dp[i+1][j+1]=(nc,(i,j))
+    align=[None]*L; i,j=L,T
+    while i or j:
+        _,b=dp[i][j]; pi,pj=b or (0,0)
+        if pi==i-1 and pj==j-1: align[i-1]=j-1
+        i,j=pi,pj
+    return align
+def build_lyrics_srt(lyrics_text, align, trans_words):
+    lines=[l.strip() for l in lyrics_text.splitlines()]
+    lyric_words,_=lyrics_to_word_list(lyrics_text)
+    line_map={}
+    for i,(w,li) in enumerate(lyric_words):
+        if align[i] is not None:
+            line_map.setdefault(li,[]).append(align[i])
+    subs=[]; idx=1
+    for li,line in enumerate(lines):
+        idxs=line_map.get(li,[])
+        if not idxs: continue
+        start=min(trans_words[k][1] for k in idxs)
+        end  =max(trans_words[k][2] for k in idxs)
+        subs.append(srt.Subtitle(idx,start,end,line)); idx+=1
+    return srt.compose(sorted(subs,key=lambda s:s.start))
+def align_lyrics(trans_words, lyrics_text):
+    lyric_words,_=lyrics_to_word_list(lyrics_text)
+    align=word_alignment(trans_words, lyric_words)
+    return build_lyrics_srt(lyrics_text, align, trans_words)
+# ──────────────────────────  Streamlit UI  ────────────────────────────────────
+st.set_page_config(layout="wide"); st.title("TVG LyricsAI + Demucs (GPT-4o Edition)")
+if "vocals_bytes" not in st.session_state: st.session_state.vocals_bytes=None
+if "zip_bytes" not in st.session_state:    st.session_state.zip_bytes=None
 with st.sidebar:
-    openai_api_key = st.text_input("OpenAI API Key", type="password")
-    use_demucs = st.checkbox("Use Demucs vocal isolation?")
-    stems_choice = None
+    api_key = st.text_input("OpenAI API Key", type="password")
+    use_demucs = st.checkbox("Isolate vocals with Demucs?")
     if use_demucs:
-        stems_choice = st.selectbox("Number of stems", ["2 stems (vocals)", "4 stems"])
-    st.markdown("[Get an API key](https://platform.openai.com/account/api-keys)")
-
-uploaded_audio = st.file_uploader(
-    "Upload audio (max 25 MB per OpenAI limits)",
-    type=["flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "oga", "ogg", "wav", "webm"],
-)
-lyrics_input = st.text_area("Paste lyrics (optional)")
-
-if uploaded_audio:
-    if not openai_api_key:
-        st.warning("Add your OpenAI key in the sidebar.")
-        st.stop()
-
-    if st.button("Generate SRT"):
-        st.session_state.vocals_bytes = None
-        st.session_state.srt_zip_bytes = None
-
-        # Preserve original extension & mime‑type
-        file_ext = os.path.splitext(uploaded_audio.name)[1]
-        audio_path = save_temp_file(uploaded_audio, file_ext)
-        audio_basename = os.path.splitext(uploaded_audio.name)[0]
-        mime_type = uploaded_audio.type or "application/octet-stream"
-
-        # Optional Demucs isolation
-        if use_demucs:
-            two_stems = not (stems_choice and stems_choice.startswith("4"))
-            with st.spinner("Running Demucs …"):
-                vocals_mp3 = run_demucs_vocals_mp3(audio_path, two_stems=two_stems)
-            with open(vocals_mp3, "rb") as vf:
-                st.session_state.vocals_bytes = vf.read()
-            processed_path = vocals_mp3
-            mime_type = "audio/mpeg"
-        else:
-            processed_path = audio_path
-
-        ############################################################
-        # 3) Transcribe with GPT‑4o‑Transcribe
-        ############################################################
-        transcribe_url = "https://api.openai.com/v1/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {openai_api_key}"}
-        data = {
-            "model": "gpt-4o-transcribe",
-            "response_format": "srt",
-            "temperature": 0,
-        }
-
-        with st.spinner("Transcribing with GPT‑4o …"):
-            with open(processed_path, "rb") as f:
-                files = {"file": (os.path.basename(processed_path), f, mime_type)}
-                resp = requests.post(transcribe_url, headers=headers, data=data, files=files, timeout=600)
-                resp.raise_for_status()
-            original_srt = resp.text
-
-        # Optional lyric alignment
-        if lyrics_input.strip():
-            with st.spinner("Aligning to provided lyrics …"):
-                final_srt = lyrics_driven_srt(original_srt, lyrics_input)
-        else:
-            final_srt = original_srt
-
-        # Package ZIP
-        zip_path = create_zip(audio_basename, original_srt, final_srt)
-        with open(zip_path, "rb") as zf:
-            st.session_state.srt_zip_bytes = zf.read()
-
-        st.success("Done! Download your files below.")
-
-# Download buttons (persist across reruns)
+        stems_choice = st.selectbox("Demucs stems", ["2 stems (vocals)","4 stems"])
+    else: stems_choice=None
+    st.markdown("[Get an API key](https://platform.openai.com/account/api-keys)")
+up_audio = st.file_uploader("Upload Audio", type=[
+    "flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm"])
+lyrics_txt = st.text_area("Paste lyrics (optional)")
+if up_audio and st.button("Generate SRT"):
+    if not api_key: st.warning("Add your API key."); st.stop()
+    # fresh state
+    st.session_state.vocals_bytes=st.session_state.zip_bytes=None
+    audio_path=save_temp_file(up_audio,".wav"); base=os.path.splitext(up_audio.name)[0]
+    # Demucs if selected
+    if use_demucs:
+        with st.spinner("Running Demucs…"):
+            vocals_mp3 = run_demucs_vocals_mp3(audio_path,
+                          two_stems=not stems_choice.startswith("4"))
+        with open(vocals_mp3,"rb") as f: st.session_state.vocals_bytes=f.read()
+        proc_path, mime = vocals_mp3, "audio/mpeg"
+    else:
+        proc_path, mime = audio_path, "audio/wav"
+    # ───────────  Transcribe with GPT-4o  ───────────
+    model="gpt-4o-transcribe"
+    headers={"Authorization":f"Bearer {api_key}"}
+    data={
+        "model":model,
+        "response_format":"json",          # <-- critical fix
+        "timestamp_granularities[]":"word" # ask for word stamps
+    }
+    with st.spinner("Transcribing with GPT-4o…"):
+        with open(proc_path,"rb") as f:
+            resp = requests.post("https://api.openai.com/v1/audio/transcriptions",
+                                  headers=headers,
+                                  files={"file":(os.path.basename(proc_path),f,mime)},
+                                  data=data)
+        # surface any error details
+        try: resp.raise_for_status()
+        except requests.HTTPError as e:
+            st.error(f"OpenAI error: {resp.text or e}")
+            st.stop()
+    json_str = resp.text
+    original_srt, trans_words = json_to_srt_and_words(json_str)
+    # ───────────  optional lyrics alignment  ───────────
+    if lyrics_txt.strip():
+        with st.spinner("Aligning lyrics…"):
+            final_srt = align_lyrics(trans_words, lyrics_txt)
+    else:
+        final_srt = original_srt
+    zip_path = create_zip(base, original_srt, final_srt)
+    with open(zip_path,"rb") as z: st.session_state.zip_bytes=z.read()
+    st.success("All done!  Downloads below ↓")
+# ──────────────────────────  Download buttons  ───────────────────────────────
 if st.session_state.vocals_bytes:
-    st.download_button(
-        "Download isolated vocals (MP3)",
-        data=st.session_state.vocals_bytes,
-        file_name="vocals.mp3",
-        mime="audio/mpeg",
-    )
-
-if st.session_state.srt_zip_bytes:
-    st.download_button(
-        "Download SRT files (ZIP)",
-        data=st.session_state.srt_zip_bytes,
-        file_name="srt_files.zip",
-        mime="application/zip",
-    )
+    st.download_button("Download isolated vocals (MP3)",
+        st.session_state.vocals_bytes,"vocals.mp3","audio/mpeg")
+if st.session_state.zip_bytes:
+    st.download_button("Download SRT files (ZIP)",
+        st.session_state.zip_bytes,"captions.zip","application/zip")
