@@ -232,7 +232,7 @@ if uploaded_audio and st.button("Generate SRT"):
         "model": "gpt-4o-transcribe",
         "response_format": "json",
         "timestamp_granularities[]": "word",
-        "temperature": 0,
+        "temperature": [0, 0.2, 0.4],
     }
     with safe_step("Transcribing with GPT-4o"):
         with open(proc_path, "rb") as f:
